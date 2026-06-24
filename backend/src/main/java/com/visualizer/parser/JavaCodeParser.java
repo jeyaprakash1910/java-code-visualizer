@@ -68,9 +68,64 @@ public class JavaCodeParser {
     private List<ValidationError> validate(CompilationUnit cu) {
         List<ValidationError> errors = new ArrayList<>();
         checkStructure(cu, errors);
+        checkInheritance(cu, errors);
         checkMethods(cu, errors);
-        new ValidationVisitor(userDefinedClassNames(cu), declaredMethodNames(cu)).visit(cu, errors);
+        new ValidationVisitor(userDefinedClassNames(cu), declaredMethodNames(cu),
+                classesWithConstructor(cu)).visit(cu, errors);
         return errors;
+    }
+
+    /**
+     * Inheritance rules (Phase 4A): a class may {@code extends} exactly one existing
+     * user class, with no self-inheritance and no cycles.
+     */
+    private void checkInheritance(CompilationUnit cu, List<ValidationError> errors) {
+        List<ClassOrInterfaceDeclaration> classes = cu.findAll(ClassOrInterfaceDeclaration.class);
+        java.util.Set<String> classNames = classes.stream()
+                .map(ClassOrInterfaceDeclaration::getNameAsString)
+                .collect(java.util.stream.Collectors.toSet());
+
+        // parent map for cycle detection (only edges to known classes).
+        java.util.Map<String, String> parent = new java.util.HashMap<>();
+        for (ClassOrInterfaceDeclaration cls : classes) {
+            if (cls.getExtendedTypes().isEmpty()) {
+                continue;
+            }
+            String child = cls.getNameAsString();
+            String superName = cls.getExtendedTypes(0).getNameAsString();
+            Integer line = cls.getBegin().map(p -> p.line).orElse(null);
+            if (superName.equals(child)) {
+                errors.add(new ValidationError(line, "A class cannot extend itself ('" + child + "')."));
+                continue;
+            }
+            if (!classNames.contains(superName)) {
+                errors.add(new ValidationError(line, "Superclass '" + superName
+                        + "' of '" + child + "' is not defined in this file."));
+                continue;
+            }
+            parent.put(child, superName);
+        }
+
+        // Cycle detection: walk each class's ancestry; a repeat is a cycle.
+        for (String start : parent.keySet()) {
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            String current = start;
+            while (current != null && seen.add(current)) {
+                current = parent.get(current);
+            }
+            if (current != null) { // re-entered a class already on the path
+                errors.add(new ValidationError(null,
+                        "Inheritance cycle detected involving class '" + start + "'."));
+            }
+        }
+    }
+
+    /** Classes declaring at least one constructor (so {@code new T(args)} is allowed). */
+    private static java.util.Set<String> classesWithConstructor(CompilationUnit cu) {
+        return cu.findAll(ClassOrInterfaceDeclaration.class).stream()
+                .filter(c -> !c.getConstructors().isEmpty())
+                .map(ClassOrInterfaceDeclaration::getNameAsString)
+                .collect(java.util.stream.Collectors.toSet());
     }
 
     /** All class names declared in the compilation unit (Phase 2A: instantiable types). */
@@ -88,18 +143,18 @@ public class JavaCodeParser {
                 .findFirst();
     }
 
-    /** Names of methods declared in the main class — the set callable from main (Phase 2D). */
+    /** Names of every method declared in any class — the set callable (Phase 3A). */
     private static java.util.Set<String> declaredMethodNames(CompilationUnit cu) {
-        return mainClass(cu)
-                .map(cls -> cls.getMethods().stream()
-                        .map(MethodDeclaration::getNameAsString)
-                        .collect(java.util.stream.Collectors.<String>toSet()))
-                .orElseGet(java.util.Set::of);
+        return cu.findAll(ClassOrInterfaceDeclaration.class).stream()
+                .flatMap(cls -> cls.getMethods().stream())
+                .map(MethodDeclaration::getNameAsString)
+                .collect(java.util.stream.Collectors.toSet());
     }
 
     /**
-     * Method-level structural rules (Phase 2D): methods live only in the main class,
-     * have unique names (no overloading), and never call themselves (no recursion).
+     * Method-level structural rules (Phase 3A): instance methods are allowed in
+     * user classes, but the main class may declare only static methods. Within each
+     * class, method names are unique (no overloading) and never directly recursive.
      */
     private void checkMethods(CompilationUnit cu, List<ValidationError> errors) {
         java.util.Optional<ClassOrInterfaceDeclaration> main = mainClass(cu);
@@ -108,35 +163,90 @@ public class JavaCodeParser {
         }
         ClassOrInterfaceDeclaration mainCls = main.get();
 
-        // Helper methods are only supported in the class that declares main.
         for (ClassOrInterfaceDeclaration cls : cu.findAll(ClassOrInterfaceDeclaration.class)) {
-            if (cls != mainCls && !cls.getMethods().isEmpty()) {
-                cls.getMethods().forEach(m -> errors.add(new ValidationError(
-                        m.getBegin().map(p -> p.line).orElse(null),
-                        "Methods are only supported in the class that declares main.")));
+            // At most one constructor per class (no overloading / no chaining) — Phase 3C.
+            if (cls.getConstructors().size() > 1) {
+                cls.getConstructors().stream().skip(1).forEach(ctor ->
+                        errors.add(new ValidationError(ctor.getBegin().map(p -> p.line).orElse(null),
+                                "Overloaded / multiple constructors are not supported. Keep one"
+                                        + " constructor in '" + cls.getNameAsString() + "'.")));
             }
+
+            // The class declaring main may hold only static methods (no `this` there).
+            if (cls == mainCls) {
+                for (MethodDeclaration m : cls.getMethods()) {
+                    if (!m.isStatic()) {
+                        errors.add(new ValidationError(m.getBegin().map(p -> p.line).orElse(null),
+                                "Methods in the class declaring main must be static. Move instance"
+                                        + " method '" + m.getNameAsString() + "' into a user class."));
+                    }
+                }
+            }
+
+            // Unique names within the class (reject overloading / duplicates).
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            for (MethodDeclaration m : cls.getMethods()) {
+                if (!seen.add(m.getNameAsString())) {
+                    errors.add(new ValidationError(m.getBegin().map(p -> p.line).orElse(null),
+                            "Method overloading / duplicate method '" + m.getNameAsString()
+                                    + "' is not supported."));
+                }
+            }
+
+            // Direct recursion is allowed (Phase 3E); mutual recursion is not.
+            checkMutualRecursion(cls, errors);
+        }
+    }
+
+    /**
+     * Reject mutual recursion within a class (Phase 3E): two distinct methods that
+     * can reach each other through unqualified intra-class calls. A method calling
+     * itself (direct recursion) is permitted — it is an SCC of one node.
+     */
+    private void checkMutualRecursion(ClassOrInterfaceDeclaration cls, List<ValidationError> errors) {
+        java.util.Set<String> methodNames = cls.getMethods().stream()
+                .map(MethodDeclaration::getNameAsString)
+                .collect(java.util.stream.Collectors.toSet());
+
+        // Call graph from unqualified calls that target a sibling method.
+        java.util.Map<String, java.util.Set<String>> callees = new java.util.HashMap<>();
+        for (MethodDeclaration m : cls.getMethods()) {
+            java.util.Set<String> targets = m.findAll(MethodCallExpr.class).stream()
+                    .filter(call -> call.getScope().isEmpty())
+                    .map(MethodCallExpr::getNameAsString)
+                    .filter(methodNames::contains)
+                    .collect(java.util.stream.Collectors.toSet());
+            callees.computeIfAbsent(m.getNameAsString(), k -> new java.util.HashSet<>()).addAll(targets);
         }
 
-        // Unique names (reject overloading / duplicates) within the main class.
-        java.util.Set<String> seen = new java.util.HashSet<>();
-        for (MethodDeclaration m : mainCls.getMethods()) {
-            if (!seen.add(m.getNameAsString())) {
-                errors.add(new ValidationError(m.getBegin().map(p -> p.line).orElse(null),
-                        "Method overloading / duplicate method '" + m.getNameAsString()
-                                + "' is not supported."));
-            }
-        }
-
-        // No direct recursion: a method may not call itself (unqualified) in its body.
-        for (MethodDeclaration m : mainCls.getMethods()) {
+        java.util.Set<String> reported = new java.util.HashSet<>();
+        for (MethodDeclaration m : cls.getMethods()) {
             String name = m.getNameAsString();
-            boolean recurses = m.findAll(MethodCallExpr.class).stream()
-                    .anyMatch(call -> call.getScope().isEmpty() && call.getNameAsString().equals(name));
-            if (recurses) {
+            java.util.Set<String> reachable = reachableMethods(name, callees);
+            boolean mutual = reachable.stream()
+                    .anyMatch(other -> !other.equals(name)
+                            && reachableMethods(other, callees).contains(name));
+            if (mutual && reported.add(name)) {
                 errors.add(new ValidationError(m.getBegin().map(p -> p.line).orElse(null),
-                        "Recursion is not supported. Method '" + name + "' calls itself."));
+                        "Mutual recursion is not supported. Method '" + name
+                                + "' participates in a call cycle."));
             }
         }
+    }
+
+    /** Methods reachable from {@code start} in one or more unqualified-call steps. */
+    private static java.util.Set<String> reachableMethods(
+            String start, java.util.Map<String, java.util.Set<String>> callees) {
+        java.util.Set<String> visited = new java.util.HashSet<>();
+        java.util.Deque<String> queue =
+                new java.util.ArrayDeque<>(callees.getOrDefault(start, java.util.Set.of()));
+        while (!queue.isEmpty()) {
+            String next = queue.poll();
+            if (visited.add(next)) {
+                queue.addAll(callees.getOrDefault(next, java.util.Set.of()));
+            }
+        }
+        return visited;
     }
 
     /**

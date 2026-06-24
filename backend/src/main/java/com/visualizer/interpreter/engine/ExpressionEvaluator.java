@@ -15,6 +15,7 @@ import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
+import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.expr.UnaryExpr;
 import com.visualizer.interpreter.runtime.ArrayHeapObject;
 import com.visualizer.interpreter.runtime.CallStack;
@@ -82,7 +83,10 @@ public final class ExpressionEvaluator {
             return Value.of(unescape(lit.getValue()));
         }
         if (expr instanceof NameExpr name) {
-            return callStack.read(name.getNameAsString());
+            return resolveName(name.getNameAsString()).value();
+        }
+        if (expr instanceof ThisExpr) {
+            return evaluateThis();
         }
         if (expr instanceof FieldAccessExpr field) {
             return evaluateFieldAccess(field);
@@ -126,6 +130,15 @@ public final class ExpressionEvaluator {
         String className = creation.getType().getNameAsString();
         List<FieldDefinition> fields = classFields.getOrDefault(className, List.of());
         HeapObject object = heap.allocate(className, fields);
+        // Evaluate constructor arguments in the caller's frame, then run the
+        // constructor on the new object (a no-op when the class has none).
+        List<Value> arguments = new java.util.ArrayList<>(creation.getArguments().size());
+        for (Expression arg : creation.getArguments()) {
+            arguments.add(evaluate(arg));
+        }
+        if (methodInvoker != null) {
+            methodInvoker.invokeConstructor(object.objectId(), className, arguments);
+        }
         return Value.reference(object.objectId(), object.className());
     }
 
@@ -292,7 +305,24 @@ public final class ExpressionEvaluator {
         for (Expression arg : call.getArguments()) {
             arguments.add(evaluate(arg));
         }
-        return methodInvoker.invokeMethod(call.getNameAsString(), arguments);
+        if (call.getScope().isPresent()) {
+            // Instance call: resolve the receiver, then dispatch on its runtime class.
+            Value receiver = evaluate(call.getScope().get());
+            if (!(receiver instanceof ReferenceValue ref)) {
+                throw new InterpreterException("Cannot call '" + call.getNameAsString()
+                        + "' on a non-object value");
+            }
+            if (ref.isNull()) {
+                throw new InterpreterException("NullPointerException: cannot call '"
+                        + call.getNameAsString() + "' on a null reference");
+            }
+            if (!(heap.get(ref.objectId()) instanceof HeapObject object)) {
+                throw new InterpreterException("Cannot call a method on an array");
+            }
+            return methodInvoker.invokeInstance(
+                    ref.objectId(), object.className(), call.getNameAsString(), arguments);
+        }
+        return methodInvoker.invokeStatic(call.getNameAsString(), arguments);
     }
 
     // ---- Coercion (the "promotion" step) ------------------------------------
@@ -342,12 +372,17 @@ public final class ExpressionEvaluator {
         throw new InterpreterException("Operator '-' requires a numeric operand");
     }
 
-    /** Apply ++/-- to a variable; returns the new value (prefix) or old value (postfix). */
+    /** Apply ++/-- to a variable or field; returns the new value (prefix) or old (postfix). */
     private Value incDec(UnaryExpr unary, int delta, boolean prefix) {
-        if (!(unary.getExpression() instanceof NameExpr name)) {
-            throw new InterpreterException("++/-- requires a variable operand");
+        Expression operand = unary.getExpression();
+        Variable var;
+        if (operand instanceof NameExpr name) {
+            var = resolveName(name.getNameAsString());
+        } else if (operand instanceof FieldAccessExpr field) {
+            var = resolveField(field); // e.g. this.age++
+        } else {
+            throw new InterpreterException("++/-- requires a variable or field operand");
         }
-        Variable var = callStack.lookup(name.getNameAsString());
         Value old = var.value();
         Value updated;
         if (old.type() == ValueType.INT) {
@@ -478,12 +513,49 @@ public final class ExpressionEvaluator {
     /** The assignable slot named by an lvalue: a local variable or an object field. */
     private Variable resolveAssignTarget(Expression target) {
         if (target instanceof NameExpr name) {
-            return callStack.lookup(name.getNameAsString());
+            return resolveName(name.getNameAsString());
         }
         if (target instanceof FieldAccessExpr field) {
             return resolveField(field);
         }
         throw new InterpreterException("Assignment target must be a variable or field");
+    }
+
+    /**
+     * Resolve an unqualified name to its {@link Variable} slot. Lookup order
+     * (Phase 3A): a local/parameter in the current frame, then — inside an instance
+     * method — a field of the receiver object. This is the implicit-receiver binding
+     * that lets {@code name = n} touch the receiver's field without an explicit
+     * {@code this}.
+     */
+    /**
+     * Evaluate {@code this} (Phase 3B): the reference to the current instance
+     * method's receiver, read from the frame's {@code receiverId}. Available only
+     * inside an instance method.
+     */
+    private Value evaluateThis() {
+        Integer receiverId = callStack.current().receiverId();
+        if (receiverId == null) {
+            throw new InterpreterException("'this' is not available outside an instance method");
+        }
+        String className = heap.get(receiverId) instanceof HeapObject object
+                ? object.className()
+                : callStack.current().className();
+        return Value.reference(receiverId, className);
+    }
+
+    private Variable resolveName(String name) {
+        var frame = callStack.current();
+        if (frame.isDeclared(name)) {
+            return frame.lookup(name);
+        }
+        Integer receiverId = frame.receiverId();
+        if (receiverId != null && heap.get(receiverId) instanceof HeapObject object
+                && object.hasField(name)) {
+            return object.field(name);
+        }
+        // Fall back to the frame's own error for a clear "undefined variable" message.
+        return frame.lookup(name);
     }
 
     private BinaryExpr.Operator compoundToBinary(AssignExpr.Operator op) {

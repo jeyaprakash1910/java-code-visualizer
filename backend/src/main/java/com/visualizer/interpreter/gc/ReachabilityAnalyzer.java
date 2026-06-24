@@ -35,10 +35,16 @@ public final class ReachabilityAnalyzer {
         Set<Integer> reachable = new LinkedHashSet<>();
         Deque<Integer> worklist = new ArrayDeque<>();
 
-        // Roots: every reference held by a variable in any active frame.
+        // Roots: every reference held by a variable in any active frame, plus the
+        // receiver of any active instance-method frame (Phase 3A) — so an object a
+        // method is currently running on stays reachable even with no local holding it.
         for (StackFrame frame : callStack.frames()) {
             for (Variable variable : frame.variables()) {
                 follow(variable.value(), reachable, worklist);
+            }
+            Integer receiverId = frame.receiverId();
+            if (receiverId != null && reachable.add(receiverId)) {
+                worklist.push(receiverId);
             }
         }
 

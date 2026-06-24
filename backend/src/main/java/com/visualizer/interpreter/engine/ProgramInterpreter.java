@@ -2,6 +2,7 @@ package com.visualizer.interpreter.engine;
 
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.visualizer.interpreter.gc.ReachabilityAnalyzer;
@@ -56,9 +57,9 @@ public final class ProgramInterpreter {
         ExpressionEvaluator evaluator =
                 new ExpressionEvaluator(callStack, heap, classFields(cu), emitter);
         ExecutionContext context = new ExecutionContext();
-        Map<String, MethodDeclaration> methodRegistry = methodRegistry(clazz);
         StatementExecutor executor = new StatementExecutor(
-                callStack, console, evaluator, emitter, context, methodRegistry, clazz.getNameAsString());
+                callStack, console, evaluator, emitter, context,
+                methodRegistry(cu), constructorRegistry(cu), clazz.getNameAsString());
         // Break the evaluator ↔ executor cycle: calls in expressions reach the executor.
         evaluator.setMethodInvoker(executor);
 
@@ -88,27 +89,79 @@ public final class ProgramInterpreter {
      * {@link ValueType} (user classes → {@link ValueType#REFERENCE}); validation has
      * already confirmed the types are supported.
      */
-    /** {@code methodName → declaration} for every method in the main class (Phase 2D). */
-    private static Map<String, MethodDeclaration> methodRegistry(ClassOrInterfaceDeclaration clazz) {
+    /**
+     * {@code "Class.method" → declaration} for every method in every class
+     * (Phase 3A): methods now live in multiple classes, so the registry is keyed by
+     * declaring class to disambiguate (e.g. {@code Person.setName}, {@code Main.add}).
+     */
+    private static Map<String, MethodDeclaration> methodRegistry(CompilationUnit cu) {
         Map<String, MethodDeclaration> registry = new LinkedHashMap<>();
-        for (MethodDeclaration method : clazz.getMethods()) {
-            registry.put(method.getNameAsString(), method);
+        for (ClassOrInterfaceDeclaration clazz : cu.findAll(ClassOrInterfaceDeclaration.class)) {
+            for (MethodDeclaration method : clazz.getMethods()) {
+                registry.put(clazz.getNameAsString() + "." + method.getNameAsString(), method);
+            }
         }
         return registry;
     }
 
-    private static Map<String, List<FieldDefinition>> classFields(CompilationUnit cu) {
-        Map<String, List<FieldDefinition>> result = new LinkedHashMap<>();
+    /**
+     * {@code className → constructor} for each class declaring one (Phase 3C).
+     * Validation guarantees at most one constructor per class.
+     */
+    private static Map<String, ConstructorDeclaration> constructorRegistry(CompilationUnit cu) {
+        Map<String, ConstructorDeclaration> registry = new LinkedHashMap<>();
         for (ClassOrInterfaceDeclaration clazz : cu.findAll(ClassOrInterfaceDeclaration.class)) {
-            List<FieldDefinition> fields = new ArrayList<>();
-            for (FieldDeclaration field : clazz.getFields()) {
-                String typeName = field.getElementType().asString();
-                ValueType type = ValueType.resolveDeclared(typeName);
-                field.getVariables().forEach(v ->
-                        fields.add(new FieldDefinition(v.getNameAsString(), type, typeName)));
-            }
-            result.put(clazz.getNameAsString(), fields);
+            clazz.getConstructors().stream().findFirst()
+                    .ifPresent(ctor -> registry.put(clazz.getNameAsString(), ctor));
+        }
+        return registry;
+    }
+
+    /**
+     * Each class's full field schema, <em>flattened across inheritance</em>
+     * (Phase 4A): inherited fields first (root → ... → parent), then the class's own
+     * fields. A {@code new Dog()} therefore allocates one flat {@link FieldDefinition}
+     * list holding both {@code Animal} and {@code Dog} fields, so field access works
+     * uniformly without per-access parent lookup.
+     */
+    private static Map<String, List<FieldDefinition>> classFields(CompilationUnit cu) {
+        Map<String, ClassOrInterfaceDeclaration> byName = new LinkedHashMap<>();
+        for (ClassOrInterfaceDeclaration clazz : cu.findAll(ClassOrInterfaceDeclaration.class)) {
+            byName.put(clazz.getNameAsString(), clazz);
+        }
+        Map<String, List<FieldDefinition>> result = new LinkedHashMap<>();
+        for (ClassOrInterfaceDeclaration clazz : byName.values()) {
+            result.put(clazz.getNameAsString(), flattenFields(clazz, byName));
         }
         return result;
+    }
+
+    /** Fields of {@code clazz} and all its ancestors, ordered root-first. */
+    private static List<FieldDefinition> flattenFields(
+            ClassOrInterfaceDeclaration clazz, Map<String, ClassOrInterfaceDeclaration> byName) {
+        // Walk up the chain (validation guarantees no cycles / missing parents).
+        java.util.Deque<ClassOrInterfaceDeclaration> lineage = new java.util.ArrayDeque<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        ClassOrInterfaceDeclaration current = clazz;
+        while (current != null && seen.add(current.getNameAsString())) {
+            lineage.push(current); // push so the root ends up first on iteration
+            current = current.getExtendedTypes().isEmpty()
+                    ? null
+                    : byName.get(current.getExtendedTypes(0).getNameAsString());
+        }
+        List<FieldDefinition> fields = new ArrayList<>();
+        for (ClassOrInterfaceDeclaration cls : lineage) {
+            ownFields(cls, fields);
+        }
+        return fields;
+    }
+
+    private static void ownFields(ClassOrInterfaceDeclaration clazz, List<FieldDefinition> out) {
+        for (FieldDeclaration field : clazz.getFields()) {
+            String typeName = field.getElementType().asString();
+            ValueType type = ValueType.resolveDeclared(typeName);
+            field.getVariables().forEach(v ->
+                    out.add(new FieldDefinition(v.getNameAsString(), type, typeName)));
+        }
     }
 }

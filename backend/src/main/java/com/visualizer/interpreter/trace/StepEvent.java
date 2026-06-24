@@ -23,5 +23,7 @@ public enum StepEvent {
     ARRAY_ASSIGN,
     ARRAY_READ,
     GC_MARK,
-    GC_COLLECT
+    GC_COLLECT,
+    CONSTRUCTOR_ENTER,
+    CONSTRUCTOR_EXIT
 }

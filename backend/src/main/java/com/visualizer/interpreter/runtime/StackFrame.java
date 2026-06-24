@@ -17,11 +17,23 @@ public final class StackFrame {
 
     private final String methodName;
     private final String className;
+    /**
+     * For an instance-method frame, the heap id of the receiver object (Phase 3A);
+     * {@code null} for static methods / {@code main}. Lets the interpreter resolve
+     * unqualified field names against the receiver. Pure data — the decision to
+     * consult it lives in the interpreter, not here.
+     */
+    private final Integer receiverId;
     private final Map<String, Variable> variables = new LinkedHashMap<>();
 
     public StackFrame(String className, String methodName) {
+        this(className, methodName, null);
+    }
+
+    public StackFrame(String className, String methodName, Integer receiverId) {
         this.className = className;
         this.methodName = methodName;
+        this.receiverId = receiverId;
     }
 
     public String methodName() {
@@ -30,6 +42,11 @@ public final class StackFrame {
 
     public String className() {
         return className;
+    }
+
+    /** The receiver object's heap id for an instance-method frame, else {@code null}. */
+    public Integer receiverId() {
+        return receiverId;
     }
 
     public boolean isDeclared(String name) {

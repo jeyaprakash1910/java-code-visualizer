@@ -38,6 +38,11 @@ public class Interpreter {
             return programInterpreter.run(outcome.compilationUnit()).trace();
         } catch (ExecutionLimitExceededException e) {
             return ExecutionTrace.error(new ErrorInfoDto("EXECUTION_LIMIT", e.getMessage(), null));
+        } catch (StackOverflowError e) {
+            // Unbounded recursion can exhaust the host stack before the per-statement
+            // limit fires; surface it as the same bounded-execution failure.
+            return ExecutionTrace.error(new ErrorInfoDto("EXECUTION_LIMIT",
+                    "Execution limit exceeded. Possible infinite recursion detected.", null));
         } catch (InterpreterException e) {
             return ExecutionTrace.error(new ErrorInfoDto("RUNTIME_ERROR", e.getMessage(), null));
         }

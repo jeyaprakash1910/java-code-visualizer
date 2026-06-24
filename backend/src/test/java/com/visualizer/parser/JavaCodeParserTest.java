@@ -96,13 +96,47 @@ class JavaCodeParserTest {
     }
 
     @Test
-    void rejectsInheritance() {
+    void rejectsExtendingAnUndefinedClass() {
+        // Phase 4A: extends is allowed, but only of a class defined in this file.
         List<ValidationError> errors = errorsFor("""
                 public class Main extends Object {
                     public static void main(String[] args) {}
                 }
                 """);
-        assertThat(errors).anyMatch(e -> e.message().contains("Inheritance"));
+        assertThat(errors).anyMatch(e -> e.message().contains("Superclass"));
+    }
+
+    @Test
+    void allowsExtendingAUserClass() {
+        List<ValidationError> errors = errorsFor("""
+                class Animal { String name; }
+                class Dog extends Animal { int age; }
+                public class Main {
+                    public static void main(String[] args) {
+                        Dog d = new Dog();
+                    }
+                }
+                """);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void rejectsSelfInheritance() {
+        List<ValidationError> errors = errorsFor("""
+                class A extends A {}
+                public class Main { public static void main(String[] args) {} }
+                """);
+        assertThat(errors).anyMatch(e -> e.message().contains("cannot extend itself"));
+    }
+
+    @Test
+    void rejectsInheritanceCycle() {
+        List<ValidationError> errors = errorsFor("""
+                class A extends B {}
+                class B extends A {}
+                public class Main { public static void main(String[] args) {} }
+                """);
+        assertThat(errors).anyMatch(e -> e.message().contains("cycle"));
     }
 
     @Test
@@ -118,25 +152,57 @@ class JavaCodeParserTest {
     }
 
     @Test
-    void rejectsInstanceMethods() {
+    void rejectsInstanceMethodsInMainClass() {
+        // Phase 3A: instance methods are allowed in user classes, but the class
+        // declaring main may only have static methods.
         List<ValidationError> errors = errorsFor("""
                 public class Main {
                     public static void main(String[] args) {}
                     int helper() { return 1; }
                 }
                 """);
-        assertThat(errors).anyMatch(e -> e.message().contains("Instance methods"));
+        assertThat(errors).anyMatch(e -> e.message().contains("must be static"));
     }
 
     @Test
-    void rejectsRecursion() {
+    void allowsInstanceMethodsInUserClasses() {
+        List<ValidationError> errors = errorsFor("""
+                class Person {
+                    String name;
+                    void setName(String n) { name = n; }
+                }
+                public class Main {
+                    public static void main(String[] args) {
+                        Person p = new Person();
+                        p.setName("John");
+                    }
+                }
+                """);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void allowsDirectRecursion() {
+        // Phase 3E: a method may call itself.
         List<ValidationError> errors = errorsFor("""
                 public class Main {
                     public static void main(String[] args) {}
-                    static int loop() { return loop(); }
+                    static int loop(int n) { if (n == 0) return 0; return loop(n - 1); }
                 }
                 """);
-        assertThat(errors).anyMatch(e -> e.message().contains("Recursion"));
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void rejectsMutualRecursion() {
+        List<ValidationError> errors = errorsFor("""
+                public class Main {
+                    public static void main(String[] args) {}
+                    static int a(int n) { return b(n); }
+                    static int b(int n) { return a(n); }
+                }
+                """);
+        assertThat(errors).anyMatch(e -> e.message().contains("Mutual recursion"));
     }
 
     @Test

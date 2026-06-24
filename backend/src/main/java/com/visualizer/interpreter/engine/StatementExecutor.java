@@ -1,6 +1,7 @@
 package com.visualizer.interpreter.engine;
 
 import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.expr.AssignExpr;
@@ -46,9 +47,11 @@ public final class StatementExecutor implements MethodInvoker {
     private final ExpressionEvaluator evaluator;
     private final StepEmitter steps;
     private final ExecutionContext context;
-    /** methodName → its declaration, used to invoke user static methods (Phase 2D). */
+    /** "Class.method" → its declaration, used to invoke user methods (Phase 2D/3A). */
     private final Map<String, MethodDeclaration> methods;
-    /** Class that declares the methods — used as the frame's class label. */
+    /** className → its (single) constructor declaration, if any (Phase 3C). */
+    private final Map<String, ConstructorDeclaration> constructors;
+    /** The class that declares main — used as the frame's class label for static calls. */
     private final String className;
 
     public StatementExecutor(CallStack callStack,
@@ -57,6 +60,7 @@ public final class StatementExecutor implements MethodInvoker {
                              StepEmitter steps,
                              ExecutionContext context,
                              Map<String, MethodDeclaration> methods,
+                             Map<String, ConstructorDeclaration> constructors,
                              String className) {
         this.callStack = callStack;
         this.console = console;
@@ -64,6 +68,7 @@ public final class StatementExecutor implements MethodInvoker {
         this.steps = steps;
         this.context = context;
         this.methods = methods;
+        this.constructors = constructors;
         this.className = className;
     }
 
@@ -88,31 +93,95 @@ public final class StatementExecutor implements MethodInvoker {
         }
     }
 
-    // ---- Method invocation (Phase 2D) ---------------------------------------
+    // ---- Method invocation (Phase 2D / 3A) ----------------------------------
 
     /**
-     * Invoke a user static method: bind parameters by value into a fresh frame,
-     * push it, run the body, capture the {@code return} value (via
-     * {@link ReturnSignal}), pop, and hand the value back to the caller.
-     *
-     * <p>Pass-by-value falls out for free: primitive {@link Value}s are immutable
-     * (a copy is the value itself), and a {@link ReferenceValue} copies the id, so
-     * the callee shares the caller's object but reassigning the parameter only
-     * rebinds the callee's local slot.</p>
+     * An unqualified call. Inside an instance method it is an implicit-receiver
+     * call on the same object and class (sibling dispatch); otherwise it is a static
+     * method of the main class.
      */
     @Override
-    public Value invokeMethod(String methodName, List<Value> arguments) {
-        MethodDeclaration method = methods.get(methodName);
-        if (method == null) {
-            throw new InterpreterException("Unknown method: " + methodName);
+    public Value invokeStatic(String methodName, List<Value> arguments) {
+        StackFrame caller = callStack.current();
+        if (caller.receiverId() != null) {
+            return invoke(caller.className(), methodName, caller.receiverId(), arguments);
         }
-        List<Parameter> parameters = method.getParameters();
+        return invoke(className, methodName, null, arguments);
+    }
+
+    /** {@code receiver.method(args)} resolves to {@code className.method} on the receiver. */
+    @Override
+    public Value invokeInstance(int receiverId, String className, String methodName,
+                                List<Value> arguments) {
+        return invoke(className, methodName, receiverId, arguments);
+    }
+
+    /**
+     * Run {@code className}'s constructor on the freshly-allocated receiver. With no
+     * declared constructor it is a no-op (default field values stand). Otherwise it
+     * pushes a frame (labelled with the class name, e.g. {@code Person()}), binds
+     * parameters by value, runs the body — where {@code this.x = ...} reaches the
+     * receiver's fields — then pops. Emits CONSTRUCTOR_ENTER / CONSTRUCTOR_EXIT.
+     */
+    @Override
+    public void invokeConstructor(int receiverId, String className, List<Value> arguments) {
+        ConstructorDeclaration constructor = constructors.get(className);
+        if (constructor == null) {
+            if (!arguments.isEmpty()) {
+                throw new InterpreterException("Class " + className
+                        + " has no constructor accepting " + arguments.size() + " argument(s)");
+            }
+            return; // default construction — object already default-initialized
+        }
+        List<Parameter> parameters = constructor.getParameters();
         if (parameters.size() != arguments.size()) {
-            throw new InterpreterException("Method '" + methodName + "' expects "
+            throw new InterpreterException("Constructor " + className + " expects "
                     + parameters.size() + " argument(s), got " + arguments.size());
         }
 
-        StackFrame frame = new StackFrame(className, methodName);
+        StackFrame frame = new StackFrame(className, className, receiverId);
+        for (int i = 0; i < parameters.size(); i++) {
+            Parameter param = parameters.get(i);
+            ValueType type = ValueType.resolveDeclared(param.getType().asString());
+            frame.declare(param.getNameAsString(),
+                    type, evaluator.coerce(arguments.get(i), type, false));
+        }
+
+        callStack.push(frame);
+        steps.emit(line(constructor), StepEvent.CONSTRUCTOR_ENTER, "Enter constructor " + className);
+        try {
+            execute(constructor.getBody());
+        } catch (ReturnSignal ignored) {
+            // a bare `return;` in a constructor just ends it
+        }
+        callStack.pop();
+        steps.emit(line(constructor), StepEvent.CONSTRUCTOR_EXIT, "Exit constructor " + className);
+    }
+
+    /**
+     * Shared invocation: bind parameters by value into a fresh frame (carrying the
+     * receiver id for instance calls), push it, run the body, capture the
+     * {@code return} value (via {@link ReturnSignal}), pop, and hand the value back.
+     *
+     * <p>Pass-by-value falls out for free: primitive {@link Value}s are immutable,
+     * and a {@link ReferenceValue} copies the id, so reassigning a parameter only
+     * rebinds the callee's slot. The receiver id lets the body reach the object's
+     * fields via implicit binding (no explicit {@code this}).</p>
+     */
+    private Value invoke(String ownerClass, String methodName, Integer receiverId,
+                         List<Value> arguments) {
+        String key = ownerClass + "." + methodName;
+        MethodDeclaration method = methods.get(key);
+        if (method == null) {
+            throw new InterpreterException("Unknown method: " + key);
+        }
+        List<Parameter> parameters = method.getParameters();
+        if (parameters.size() != arguments.size()) {
+            throw new InterpreterException("Method '" + key + "' expects "
+                    + parameters.size() + " argument(s), got " + arguments.size());
+        }
+
+        StackFrame frame = new StackFrame(ownerClass, methodName, receiverId);
         for (int i = 0; i < parameters.size(); i++) {
             Parameter param = parameters.get(i);
             ValueType type = ValueType.resolveDeclared(param.getType().asString());
@@ -121,7 +190,7 @@ public final class StatementExecutor implements MethodInvoker {
         }
 
         callStack.push(frame);
-        steps.emit(line(method), StepEvent.METHOD_ENTER, "Enter method " + methodName);
+        steps.emit(line(method), StepEvent.METHOD_ENTER, "Enter method " + key);
 
         Value returnValue = null;
         try {
@@ -135,7 +204,7 @@ public final class StatementExecutor implements MethodInvoker {
         }
 
         callStack.pop();
-        steps.emit(line(method), StepEvent.METHOD_EXIT, "Exit method " + methodName);
+        steps.emit(line(method), StepEvent.METHOD_EXIT, "Exit method " + key);
         return returnValue;
     }
 
@@ -191,9 +260,10 @@ public final class StatementExecutor implements MethodInvoker {
                 && (assign.getTarget() instanceof NameExpr || assign.getTarget() instanceof FieldAccessExpr)) {
             return assign.getTarget();
         }
-        if (expr instanceof UnaryExpr unary && unary.getExpression() instanceof NameExpr name
-                && isIncrementOrDecrement(unary.getOperator())) {
-            return name;
+        if (expr instanceof UnaryExpr unary && isIncrementOrDecrement(unary.getOperator())
+                && (unary.getExpression() instanceof NameExpr
+                        || unary.getExpression() instanceof FieldAccessExpr)) {
+            return unary.getExpression(); // e.g. x++ or this.age++
         }
         return null;
     }

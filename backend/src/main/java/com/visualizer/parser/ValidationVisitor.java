@@ -5,7 +5,6 @@ import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
-import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.ArrayAccessExpr;
@@ -15,6 +14,8 @@ import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.MethodReferenceExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
+import com.github.javaparser.ast.expr.SuperExpr;
+import com.github.javaparser.ast.stmt.ExplicitConstructorInvocationStmt;
 import com.github.javaparser.ast.stmt.SwitchStmt;
 import com.github.javaparser.ast.stmt.TryStmt;
 import com.github.javaparser.ast.type.ArrayType;
@@ -48,10 +49,14 @@ public class ValidationVisitor extends VoidVisitorAdapter<List<ValidationError>>
     private final Set<String> userDefinedClasses;
     /** Names of callable methods declared in the class that declares {@code main}. */
     private final Set<String> declaredMethods;
+    /** Classes that declare a constructor (so {@code new T(args)} is allowed). */
+    private final Set<String> classesWithConstructor;
 
-    public ValidationVisitor(Set<String> userDefinedClasses, Set<String> declaredMethods) {
+    public ValidationVisitor(Set<String> userDefinedClasses, Set<String> declaredMethods,
+                             Set<String> classesWithConstructor) {
         this.userDefinedClasses = userDefinedClasses;
         this.declaredMethods = declaredMethods;
+        this.classesWithConstructor = classesWithConstructor;
     }
 
     private static Integer lineOf(Node node) {
@@ -69,29 +74,32 @@ public class ValidationVisitor extends VoidVisitorAdapter<List<ValidationError>>
         if (decl.isInterface()) {
             reject(errors, decl, "Interfaces are not supported. Define a single class.");
         }
-        if (!decl.getExtendedTypes().isEmpty() || !decl.getImplementedTypes().isEmpty()) {
-            reject(errors, decl, "Inheritance (extends/implements) is not supported.");
+        // Phase 4A: single-class `extends` is allowed (validated structurally in
+        // JavaCodeParser); `implements` is not.
+        if (!decl.getImplementedTypes().isEmpty()) {
+            reject(errors, decl, "Interfaces ('implements') are not supported.");
         }
         super.visit(decl, errors);
     }
 
     @Override
-    public void visit(MethodDeclaration method, List<ValidationError> errors) {
-        // Phase 2D: additional methods are allowed, but only static ones. Instance
-        // methods (and the `this` they imply) are out of scope.
-        if (!method.isStatic()) {
-            reject(errors, method,
-                    "Instance methods are not supported. Mark '" + method.getNameAsString()
-                            + "' static, or move its logic into main.");
-            return; // don't descend into an unsupported method body
-        }
-        super.visit(method, errors);
+    public void visit(ConstructorDeclaration constructor, List<ValidationError> errors) {
+        // Phase 3C: constructors are supported. Descend to validate the body, but
+        // this(...) / super(...) delegation is still rejected (see below).
+        super.visit(constructor, errors);
     }
 
     @Override
-    public void visit(ConstructorDeclaration constructor, List<ValidationError> errors) {
-        reject(errors, constructor, "Constructors are not supported yet.");
-        // Do not descend; constructor bodies are out of scope.
+    public void visit(SuperExpr expr, List<ValidationError> errors) {
+        reject(errors, expr, "'super' is not supported yet.");
+        super.visit(expr, errors);
+    }
+
+    @Override
+    public void visit(ExplicitConstructorInvocationStmt stmt, List<ValidationError> errors) {
+        // this(...) / super(...) constructor delegation.
+        reject(errors, stmt, "Constructor calls (this(...) / super(...)) are not supported yet.");
+        super.visit(stmt, errors);
     }
 
     @Override
@@ -130,11 +138,12 @@ public class ValidationVisitor extends VoidVisitorAdapter<List<ValidationError>>
         if (!userDefinedClasses.contains(typeName)) {
             reject(errors, expr, "Object creation ('new " + expr.getTypeAsString()
                     + "') is not supported. Only user-defined classes in this file can be instantiated.");
-        } else if (!expr.getArguments().isEmpty()) {
-            reject(errors, expr, "Constructor arguments are not supported yet. Use 'new "
-                    + typeName + "()'.");
         } else if (expr.getAnonymousClassBody().isPresent()) {
             reject(errors, expr, "Anonymous classes are not supported yet.");
+        } else if (!expr.getArguments().isEmpty() && !classesWithConstructor.contains(typeName)) {
+            // Arguments require a matching constructor (Phase 3C). Arity is checked at runtime.
+            reject(errors, expr, "Class '" + typeName + "' has no constructor; use 'new "
+                    + typeName + "()'.");
         }
         super.visit(expr, errors);
     }
@@ -214,14 +223,14 @@ public class ValidationVisitor extends VoidVisitorAdapter<List<ValidationError>>
             super.visit(call, errors);
             return;
         }
-        // A call to a user-defined static method: unqualified (no scope) and naming
-        // a method declared in the main class.
-        boolean userMethodCall = call.getScope().isEmpty()
-                && declaredMethods.contains(call.getNameAsString());
-        if (!userMethodCall) {
+        // A call to a user-defined method: either unqualified (a static method of the
+        // main class) or qualified (an instance method, e.g. p.setName(...)). In both
+        // cases the method name must be declared by some class; the receiver's actual
+        // class is resolved at runtime.
+        if (!declaredMethods.contains(call.getNameAsString())) {
             reject(errors, call, "Method call '" + call.getNameAsString()
-                    + "' is not supported. Only System.out.print/println and static methods"
-                    + " declared in this class may be called.");
+                    + "' is not supported. Only System.out.print/println and methods"
+                    + " declared in this file may be called.");
         }
         super.visit(call, errors);
     }

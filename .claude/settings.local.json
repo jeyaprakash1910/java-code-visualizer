@@ -3,7 +3,9 @@
     "allow": [
       "Bash(mvn -q test)",
       "Bash(mvn test *)",
-      "Bash(grep -E *)"
+      "Bash(grep -E *)",
+      "Bash(mvn -q compile test-compile)",
+      "Bash(mvn -q compile)"
     ]
   }
 }
