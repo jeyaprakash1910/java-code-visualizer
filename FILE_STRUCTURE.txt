@@ -1,0 +1,215 @@
+================================================================================
+JAVA CODE VISUALIZER — FILE STRUCTURE & RESPONSIBILITIES
+================================================================================
+An educational tool that visually explains Java execution step-by-step:
+call stack, heap memory, object references, variable values, method calls,
+and console output.
+
+Architecture: stateless one-shot pipeline. Code in -> backend produces a full
+replayable "film" (ExecutionTrace) -> frontend "projects" it (client-side step
+playback, no further backend calls).
+
+Status (per docs/progress-log.md): Phase 0 + Phase 1 complete, with Phase 2
+runtime model (heap/objects/arrays/GC) substantially built. The Phase 0 mock
+is gone; real interpretation drives the traces.
+
+Tech: Backend = Spring Boot (Java 17), Maven, JavaParser.
+      Frontend = React + TypeScript + Vite + Monaco + React Flow + TailwindCSS.
+
+
+================================================================================
+ROOT
+================================================================================
+README.md                  Project overview, how to run backend/frontend, scope.
+.gitignore                 Root ignore rules.
+.claude/settings.local.json  Local Claude Code settings.
+FILE_STRUCTURE.txt         This file.
+
+
+================================================================================
+docs/
+================================================================================
+architecture.md            Full architecture & roadmap: execution strategy
+                           (tree-walking interpreter), JSON contract, entity
+                           design, 6-phase implementation plan.
+progress-log.md            Combined Phase 0 & Phase 1 build log; what was built,
+                           issues hit, end state. 89 backend tests green.
+
+
+================================================================================
+backend/  (Spring Boot — REST API at /api/simulate)
+================================================================================
+pom.xml                    Maven build: Spring Web + Validation + JavaParser;
+                           targets Java 17.
+.gitignore                 Backend ignore rules (target/, etc.).
+
+--- src/main/resources/ ---
+application.yml            Server config: port 8080, CORS allowed origin.
+
+--- src/main/java/com/visualizer/ ---
+VisualizerApplication.java Spring Boot main/entry class.
+
+--- com/visualizer/config/ ---
+WebConfig.java             Enables CORS so the Vite dev server (localhost:5173)
+                           can call /api/**.
+
+--- com/visualizer/api/  (REST layer) ---
+SimulationController.java  POST /api/simulate + GET /api/health. Parses,
+                           validates, and interprets submitted source via
+                           Interpreter, returning a real ExecutionTrace (or an
+                           ERROR trace on validation failure).
+
+--- com/visualizer/api/dto/  (locked JSON contract — Java records) ---
+ExecutionTrace.java        Top-level response: status, error, metadata, steps[].
+ExecutionStepDto.java      One step in the timeline: full snapshot of stack +
+                           heap + console + line + description + event.
+StackFrameDto.java         Snapshot of one call-stack frame at a step.
+HeapObjectDto.java         Snapshot of one heap object/array/string at a step.
+VariableDto.java           A named variable (frame) or field (heap object);
+                           kind/value/ref inlined per the contract.
+ValueDto.java              A value: PRIMITIVE (value set, ref null) or
+                           REFERENCE (value null, ref = heap id or null).
+ConsoleOutputDto.java      One console output entry, cumulative up to its step.
+ErrorInfoDto.java          Structured error (parse error / unsupported feature).
+TraceMetadataDto.java      Trace metadata (total steps, entry point, etc.).
+SimulateRequest.java       Request body: sourceCode + options (e.g. maxSteps).
+
+--- com/visualizer/parser/  (JavaParser wrapper + validation) ---
+JavaCodeParser.java        Turns raw source into a CompilationUnit AST and checks
+                           it uses only the supported Java subset before running.
+ParseOutcome.java          Result of parseAndValidate: either valid AST OR a
+                           non-empty list of line-numbered errors (exactly one).
+ValidationVisitor.java     Walks the AST, recording a ValidationError for every
+                           construct the interpreter can't handle yet. Never throws.
+ValidationError.java       One line-numbered reason the source was rejected.
+
+--- com/visualizer/support/ ---
+UnsupportedFeatureException.java  Thrown when code uses an unsupported construct;
+                           carries the offending source line for friendly reporting.
+
+--- com/visualizer/interpreter/ ---
+Interpreter.java           Public entry point: source in -> ExecutionTrace out.
+                           Pipeline: parse -> validate -> execute -> record trace.
+
+--- com/visualizer/interpreter/runtime/  (the simulated VM — storage model) ---
+   (Key rule: Java semantics live in the engine, NOT here; this layer is storage.)
+Value.java                 Sealed immutable runtime value (IntValue, etc.) over
+                           the four supported scalar types; pattern-matched by engine.
+ValueType.java             The scalar types the interpreter understands
+                           (int/double/boolean/char; STRING treated as scalar pre-heap).
+Variable.java              A named slot in a frame: fixed name + declared type +
+                           mutable current Value.
+StackFrame.java            One activation record: variables for a single method
+                           invocation, in declaration order.
+CallStack.java             Simulated LIFO of StackFrames; top = current frame.
+Heap.java                  Simulated heap: stores HeapEntitys, hands out unique
+                           monotonically increasing object ids.
+HeapEntity.java            Anything on the heap with stable identity (object/array).
+HeapObject.java            A heap object: objectId + className + mutable field slots.
+ArrayHeapObject.java       A 1-D array on the heap: id + element type + length +
+                           default-initialized element slots.
+ReferenceValue.java        A reference Value: points to a heap object by objectId.
+FieldDefinition.java       Schema of a class field: name + ValueType + declared
+                           type name (for typed null defaults).
+RuntimeModelException.java Base type for runtime-model storage errors.
+TypeMismatchException.java Wrong ValueType assigned to a variable.
+UndefinedVariableException.java  Read/assign a variable never declared in scope.
+VariableAlreadyDeclaredException.java  Same name declared twice in one frame.
+EmptyCallStackException.java     Current frame requested/popped from empty stack.
+RuntimeModelExample.java   Standalone runnable demo of how the engine drives the
+                           runtime model; not wired into Spring (living docs).
+
+--- com/visualizer/interpreter/engine/  (the tree-walking interpreter — semantics) ---
+ProgramInterpreter.java    Top-level driver: locate main, set up CallStack, run
+                           body statement-by-statement, emit steps, return result.
+StatementExecutor.java     Executes JavaParser Statements; owns control flow and
+                           statement effects; delegates value computation to evaluator.
+ExpressionEvaluator.java   Evaluates Expressions into runtime Values. Home of all
+                           Java language semantics (numeric promotion, operators...).
+MethodInvoker.java         Interface: invoke a user-defined static method with
+                           already-evaluated args; returns value (null for void).
+ReturnSignal.java          Control-flow signal to unwind a method body on `return`.
+RuntimeConsole.java        Captures System.out.print/println output in order.
+ExecutionContext.java      Per-run safety budget: each statement ticks a counter;
+                           bounds infinite loops.
+ExecutionLimitExceededException.java  Raised when the step budget is exceeded
+                           (e.g. while(true)), so the server never hangs.
+InterpreterException.java  Raised on a construct the engine can't evaluate
+                           (e.g. arithmetic on a boolean).
+InterpretationResult.java  Final runtime state: call stack + console + ExecutionTrace.
+ExamplePrograms.java       Supported-subset sample programs; living docs + test fixtures.
+
+--- com/visualizer/interpreter/trace/  (snapshotting -> DTOs) ---
+TraceRecorder.java         Accumulates ExecutionStepDtos in order, assigning
+                           monotonic stepIndex; builds the final ExecutionTrace.
+StepEmitter.java           The one bridge between execution and recording: captures
+                           a fresh snapshot and hands a finished step to the recorder.
+SnapshotFactory.java       Single place that turns live runtime state into
+                           immutable DTO snapshots (fresh unmodifiable lists).
+RuntimeDtoMapper.java      Pure stateless conversion from runtime model to API DTOs.
+StepEvent.java             Enum of step kinds (DECLARE, ASSIGN, METHOD_ENTER,...);
+                           name() written verbatim into the contract's event field.
+
+--- com/visualizer/interpreter/gc/ ---
+ReachabilityAnalyzer.java  Educational reachability analysis: which heap entities
+                           are still reachable from GC roots (Phase 2F / GC viz).
+
+--- src/test/java/com/visualizer/  (backend tests — 89 green) ---
+api/SimulationControllerTest.java          Endpoint-level tests for /api/simulate.
+parser/JavaCodeParserTest.java             Parse + validation subset tests.
+interpreter/engine/ProgramInterpreterTest.java  End-to-end interpretation tests.
+interpreter/trace/SnapshotFactoryTest.java Snapshot immutability/shape tests.
+interpreter/runtime/RuntimeModelTest.java  Runtime storage model tests.
+interpreter/ArrayTest.java                 Array allocation/indexing/length.
+interpreter/HeapAllocationTest.java        Object allocation on the heap.
+interpreter/ObjectFieldTest.java           Object field read/write.
+interpreter/ReferenceAliasingTest.java     Aliasing / multiple refs -> one object.
+interpreter/MethodCallTest.java            Static method push/pop, params, return.
+interpreter/GarbageCollectionTest.java     Reachability / GC behavior.
+interpreter/ExecutionSafetyTest.java       Infinite-loop guard / step budget.
+interpreter/InterpreterTraceTest.java      Trace correctness across execution.
+interpreter/TraceQualityTest.java          Trace narration/quality assertions.
+
+
+================================================================================
+frontend/  (React + TypeScript + Vite)
+================================================================================
+package.json               Dependencies + scripts (Vite dev on 5173).
+package-lock.json          Locked dependency tree.
+vite.config.ts             Vite config; proxies /api/* -> backend :8080.
+tsconfig.json              TypeScript compiler config.
+tailwind.config.js         TailwindCSS config (dark theme).
+postcss.config.js          PostCSS config (Tailwind/autoprefixer).
+index.html                 HTML entry; mounts the React app.
+.gitignore                 Frontend ignore rules (node_modules, dist).
+
+--- src/ ---
+main.tsx                   React entry; renders <App/> into the DOM.
+App.tsx                    Root component; wires editor + panels + Run button.
+sampleCode.ts              Default Java sample pre-filled in the editor.
+
+--- src/api/ ---
+simulate.ts                fetch wrapper that POSTs source to /api/simulate.
+
+--- src/types/ ---
+trace.ts                   1:1 TypeScript mirror of the backend DTO contract.
+
+--- src/state/ ---
+usePlayer.ts               Playback state hook: holds trace + current step index;
+                           prev/next/play/scrub — pure client-side navigation.
+
+--- src/components/ ---
+layout/Workspace.tsx       Layout: editor on the left, visualization panels right.
+editor/CodeEditor.tsx      Monaco editor; highlights the current execution line.
+controls/StepControls.tsx  Reset / Prev / Play-Pause / Next + slider + description.
+
+--- src/components/panels/ ---
+Panel.tsx                  Shared panel chrome (title/frame) for the panels below.
+CallStackPanel.tsx         Renders the call stack (frame push/pop, current frame).
+VariablesPanel.tsx         Renders the current frame's variables and values.
+HeapPanel.tsx              React Flow object graph: heap nodes + reference arrows.
+ConsolePanel.tsx           Renders cumulative console output for the current step.
+
+--- src/styles/ ---
+index.css                  Global/Tailwind styles + current-line highlight CSS.
+================================================================================

@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #14141f;
+  color: #e6e6f0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* React Flow renders on a light canvas by default; keep it readable on dark. */
+.react-flow__attribution {
+  display: none;
+}
+
+/* Current execution line highlight in the Monaco editor. */
+.current-line-highlight {
+  background: rgba(124, 147, 255, 0.18);
+}
+.current-line-margin {
+  background: rgba(124, 147, 255, 0.5);
+  width: 4px !important;
+}

@@ -1,0 +1,11 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: java-code-visualizer
+
+# Frontend dev origin allowed for CORS (see WebConfig)
+app:
+  cors:
+    allowed-origins: "http://localhost:5173"
